@@ -7,7 +7,7 @@ Usage:
     seoscout collect --keywords FILE
     seoscout generate --keywords FILE [--prompt FILE] [--overwrite] [--test]
     seoscout translate --keywords FILE --lang es,pt,de [--prompt FILE] [--overwrite] [--test]
-    seoscout run --keywords FILE
+    seoscout run --keywords FILE --output-dir DIR
 """
 
 import asyncio
@@ -124,6 +124,10 @@ def main():
         help="Path to keywords JSON file"
     )
     run_parser.add_argument(
+        "--output-dir", required=True,
+        help="Absolute output root for this run"
+    )
+    run_parser.add_argument(
         "--prompt",
         help="Path to custom prompt template for generation"
     )
@@ -215,29 +219,123 @@ async def _run_all(args):
     from .generate import run_generate
     from .translate import run_translate
     from .core.utils import load_languages_from_json
-
-    await run_search(args.project, args.keywords)
-    await run_collect(args.project)
-    await run_generate(
-        args.project,
-        args.keywords,
-        prompt_path=args.prompt,
-        overwrite=args.overwrite,
+    from .core.config import Config
+    from .contract import (
+        ContractError,
+        load_keyword_spec,
+        utc_now,
+        validate_collected_material,
+        validate_english_articles,
+        validate_output_dir,
+        validate_search_results,
+        validate_run_status,
+        validate_translated_articles,
+        write_run_status,
+        write_traceability_manifest,
     )
 
-    # If languages are specified in JSON, auto-translate
-    langs = load_languages_from_json(args.keywords)
-    if langs:
-        lang_str = ",".join(langs)
-        print(f"\n{'='*70}")
-        print(f"  Step 4: Translate [{args.project}] → {lang_str}")
-        print(f"{'='*70}")
-        await run_translate(
-            args.project,
-            lang_str,
-            prompt_path=None,
-            overwrite=args.overwrite,
+    try:
+        output_root = validate_output_dir(args.output_dir)
+    except ContractError as exc:
+        print(f"❌ {exc.stage}: {exc.message}", file=sys.stderr)
+        sys.exit(exc.exit_code)
+
+    os.environ["OUTPUT_DIR"] = str(output_root)
+    Config.init(args.project)
+    started_at = utc_now()
+    spec = None
+
+    try:
+        spec = load_keyword_spec(args.keywords, Config.DATA_DIR, Config.OUT_DIR)
+        write_run_status(
+            Config.OUT_DIR,
+            status="running",
+            spec=spec,
+            output_root=str(output_root),
+            started_at=started_at,
+            stage_counts={"expected_keywords": len(spec.entries)},
         )
+
+        try:
+            await run_search(args.project, args.keywords)
+            validate_search_results(spec, Config.OUT_DIR)
+            await run_collect(args.project)
+            validate_collected_material(spec)
+        except ContractError:
+            raise
+        except Exception as exc:
+            raise ContractError("search_collect", 3, str(exc)) from exc
+
+        try:
+            await run_generate(
+                args.project,
+                args.keywords,
+                prompt_path=args.prompt,
+                overwrite=args.overwrite,
+            )
+            validate_english_articles(spec)
+        except ContractError:
+            raise
+        except Exception as exc:
+            raise ContractError("english", 4, str(exc)) from exc
+
+        # If languages are specified in JSON, auto-translate
+        langs = load_languages_from_json(args.keywords)
+        langs = [lang for lang in langs if lang.lower() != "en"]
+        if langs:
+            lang_str = ",".join(langs)
+            print(f"\n{'='*70}")
+            print(f"  Step 4: Translate [{args.project}] → {lang_str}")
+            print(f"{'='*70}")
+            try:
+                await run_translate(
+                    args.project,
+                    lang_str,
+                    prompt_path=None,
+                    overwrite=args.overwrite,
+                )
+                validate_translated_articles(spec)
+            except ContractError:
+                raise
+            except Exception as exc:
+                raise ContractError("translation", 5, str(exc)) from exc
+
+        try:
+            write_traceability_manifest(spec, Config.OUT_DIR)
+            status_path = write_run_status(
+                Config.OUT_DIR,
+                status="completed",
+                spec=spec,
+                output_root=str(output_root),
+                started_at=started_at,
+                stage_counts={
+                    "expected_keywords": len(spec.entries),
+                    "english_articles": len(spec.entries),
+                    "translation_languages": len(spec.languages),
+                },
+            )
+            validate_run_status(status_path, expect_success=True)
+        except ContractError:
+            raise
+        except Exception as exc:
+            raise ContractError("manifest", 6, str(exc)) from exc
+
+    except ContractError as exc:
+        if Config.OUT_DIR:
+            write_run_status(
+                Config.OUT_DIR,
+                status="failed",
+                spec=spec,
+                output_root=str(output_root),
+                started_at=started_at,
+                failure={
+                    "stage": exc.stage,
+                    "exit_code": exc.exit_code,
+                    "message": exc.message,
+                },
+            )
+        print(f"❌ {exc.stage}: {exc.message}", file=sys.stderr)
+        sys.exit(exc.exit_code)
 
 
 if __name__ == "__main__":

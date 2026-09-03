@@ -42,6 +42,27 @@ def load_prompt_template(prompt_path: str = None) -> str:
         return f.read()
 
 
+def _render_prompt_template(template: str, values: dict) -> str:
+    """Render only Seoscout-owned placeholders; keep JSON/JS braces literal."""
+    required = ("merged_data", "current_date", "category")
+    rendered = template
+
+    for key in required:
+        token = "{" + key + "}"
+        if token not in template:
+            raise ValueError(f"Required prompt placeholder missing: {token}")
+        if key not in values:
+            raise ValueError(f"Prompt value missing for placeholder: {token}")
+        rendered = rendered.replace(token, str(values[key]))
+
+    for key in required:
+        token = "{" + key + "}"
+        if token in rendered:
+            raise ValueError(f"Required prompt placeholder was not replaced: {token}")
+
+    return rendered
+
+
 def clean_llm_output(content: str) -> str:
     """Strip code fences and trim."""
     content = content.strip()
@@ -174,11 +195,11 @@ async def run_generate(
         current_date = datetime.now().strftime('%Y-%m-%d')
         cat_slug_final = cat_slug if category else "general"
 
-        prompt = prompt_template.format(
-            merged_data=merged_json,
-            current_date=current_date,
-            category=cat_slug_final,
-        )
+        prompt = _render_prompt_template(prompt_template, {
+            'merged_data': merged_json,
+            'current_date': current_date,
+            'category': cat_slug_final,
+        })
 
         prompts.append((prompt, {'keyword': keyword, 'slug': slug, 'output_path': output_path}))
 
