@@ -153,7 +153,7 @@ async def run_generate(
 
     # Load collected material for each keyword
     collected_dir = f"{Config.OUT_DIR}/collected"
-    articles_dir = f"{Config.DATA_DIR}/articles/en"
+    articles_dir = str(Config.articles_root() / "en")
     ensure_dir(articles_dir)
 
     prompts = []
@@ -172,10 +172,9 @@ async def run_generate(
             collected_path = f"{collected_dir}/{cat_slug}/{fname}.json"
             if not os.path.exists(collected_path):
                 collected_path = f"{collected_dir}/{fname}.json"
-            output_path = f"{articles_dir}/{cat_slug}/{slug}.mdx"
         else:
             collected_path = f"{collected_dir}/{fname}.json"
-            output_path = f"{articles_dir}/{slug}.mdx"
+        output_path = str(Config.article_path("en", slug, category))
 
         if not os.path.exists(collected_path):
             skipped_no_data += 1

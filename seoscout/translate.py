@@ -23,6 +23,7 @@ from .core.utils import ensure_dir
 LANG_NAMES = {
     'es': 'Spanish',
     'pt': 'Portuguese (Brazil)',
+    'pt-br': 'Portuguese (Brazil)',
     'de': 'German',
     'fr': 'French',
     'ja': 'Japanese',
@@ -115,7 +116,7 @@ async def run_translate(
         print("  ❌ No target languages specified")
         return
 
-    resolved_names = {l: LANG_NAMES.get(l, l.upper()) for l in target_langs}
+    resolved_names = {l: LANG_NAMES.get(l.lower(), l.upper()) for l in target_langs}
     print(f"  🌍 Target: {', '.join(f'{resolved_names[l]} ({l})' for l in target_langs)}\n")
 
     # Load prompt template
@@ -123,7 +124,7 @@ async def run_translate(
     prompt_template = Template(prompt_template_str)
 
     # Find English articles (flat + category subdirs)
-    en_dir = Path(Config.DATA_DIR) / "articles" / "en"
+    en_dir = Config.articles_root() / "en"
     if not en_dir.exists():
         print(f"  ❌ No English articles found at {en_dir}")
         print("     Run `seoscout generate` first")
@@ -167,7 +168,7 @@ async def run_translate(
         for lang_code in target_langs:
             # Output as .mdx (change extension if source is .md)
             out_relative = relative.with_suffix('.mdx')
-            output_path = Path(Config.DATA_DIR) / "articles" / lang_code / out_relative
+            output_path = Config.articles_root() / lang_code / out_relative
 
             if output_path.exists() and not overwrite:
                 continue
@@ -276,7 +277,7 @@ async def run_translate(
     print(f"  Saved:   {saved}")
     print(f"  Failed:  {failed}")
     for lang_code in target_langs:
-        lang_dir = Path(Config.DATA_DIR) / "articles" / lang_code
+        lang_dir = Config.articles_root() / lang_code
         count = len(list(lang_dir.glob("**/*.mdx"))) if lang_dir.exists() else 0
         print(f"  {resolved_names[lang_code]} ({lang_code}): {count} files")
     client.print_stats()
@@ -288,7 +289,7 @@ def _build_repair_prompt(
     lang_code: str, article_name: str, error: str,
 ) -> str:
     """Build a repair prompt for failed translations."""
-    lang_name = LANG_NAMES.get(lang_code, lang_code)
+    lang_name = LANG_NAMES.get(lang_code.lower(), lang_code)
     base = template.substitute(
         language_name=lang_name,
         lang_code=lang_code,

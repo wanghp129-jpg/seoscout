@@ -6,6 +6,7 @@ Data is stored under OUTPUT_DIR/<project_name>/ for isolation.
 """
 
 import os
+from pathlib import Path
 from dotenv import load_dotenv
 
 
@@ -129,6 +130,7 @@ class Config:
         cls.CACHE_DIR = os.path.join(cls.OUT_DIR, "cache")
         cls.LOG_DIR = os.path.join(cls.DATA_DIR, "logs")
 
+        cls.articles_root()
         os.makedirs(cls.OUT_DIR, exist_ok=True)
         os.makedirs(cls.CACHE_DIR, exist_ok=True)
         os.makedirs(cls.LOG_DIR, exist_ok=True)
@@ -201,6 +203,24 @@ class Config:
         )
 
         cls._initialized = True
+
+    @classmethod
+    def articles_root(cls, data_dir=None) -> Path:
+        """Optional per-run article destination; keep legacy project layout otherwise."""
+        override = os.getenv("SEOSCOUT_ARTICLES_DIR", "")
+        if override:
+            root = Path(override)
+            if not root.is_absolute() or root.name != "articles":
+                raise ValueError("SEOSCOUT_ARTICLES_DIR must be an absolute articles directory")
+            return root
+        return Path(data_dir or cls.DATA_DIR) / "articles"
+
+    @classmethod
+    def article_path(cls, language: str, slug: str, category: str = "", data_dir=None) -> Path:
+        root = cls.articles_root(data_dir) / language
+        if category and not os.getenv("SEOSCOUT_ARTICLES_DIR", ""):
+            root /= category.lower().replace(" ", "-")
+        return root / f"{slug}.mdx"
 
     @classmethod
     def get_proxy_url(cls) -> str:

@@ -7,7 +7,11 @@ Shared by generate and translate stages. All config from Config class (.env).
 import asyncio
 import aiohttp
 import json
+import os
+import fcntl
 import time
+import uuid
+import hashlib
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -35,6 +39,7 @@ class LLMClient:
 
         self.stats = {
             'total_requests': 0,
+            'http_requests': 0,
             'successful_requests': 0,
             'failed_requests': 0,
             'total_tokens': 0,
@@ -55,27 +60,39 @@ class LLMClient:
         label = (meta or {}).get('keyword', 'unknown')
 
         for attempt in range(self.retry_attempts):
+            payload = {
+                "model": self.model,
+                "max_tokens": self.max_tokens,
+                "temperature": self.temperature,
+                "messages": [
+                    {"role": "system", "content": "You are a professional SEO content writer."},
+                    {"role": "user", "content": prompt},
+                ],
+                "stream": False,
+            }
             try:
+                attempt_dir = self._reserve_request(payload, meta or {}, attempt + 1)
+            except (OSError, ValueError, RuntimeError) as exc:
+                print(f"  ❌ Request preflight stopped for {label}: {type(exc).__name__}")
+                self.stats['failed_requests'] += 1
+                return None
+            try:
+                self.stats['http_requests'] += 1
                 async with session.post(
                     self.api_url,
-                    json={
-                        "model": self.model,
-                        "max_tokens": self.max_tokens,
-                        "temperature": self.temperature,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": "You are a professional SEO content writer.",
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                        "stream": False,
-                    },
+                    json=payload,
                     headers=self.headers,
                     timeout=aiohttp.ClientTimeout(total=self.timeout_seconds),
                 ) as resp:
+                    raw = await resp.read()
+                    if self.api_key and self.api_key.encode() in raw:
+                        self._record_attempt(attempt_dir, "sensitive_response_omitted", response_sha256=hashlib.sha256(raw).hexdigest())
+                        self.stats['failed_requests'] += 1
+                        return None
+                    self._write_private(attempt_dir / "response.raw", raw)
+                    self._record_attempt(attempt_dir, "response_received", http_status=resp.status, response_sha256=hashlib.sha256(raw).hexdigest())
                     if resp.status == 200:
-                        data = await resp.json()
+                        data = json.loads(raw)
                         self._save_debug(meta or {}, data)
                         content = data['choices'][0]['message']['content']
 
@@ -100,8 +117,7 @@ class LLMClient:
                         continue
 
                     else:
-                        err = await resp.text()
-                        print(f"  ❌ API {resp.status} for {label}: {err[:300]}")
+                        print(f"  ❌ API {resp.status} for {label}; original response saved")
                         if attempt < self.retry_attempts - 1:
                             await asyncio.sleep(self.retry_delay * (attempt + 1))
                             continue
@@ -109,18 +125,14 @@ class LLMClient:
                         return None
 
             except asyncio.TimeoutError:
+                self._record_attempt(attempt_dir, "uncertain", error_class="TimeoutError")
                 print(f"  ⏱️  Timeout for {label} (attempt {attempt+1}/{self.retry_attempts})")
-                if attempt < self.retry_attempts - 1:
-                    await asyncio.sleep(self.retry_delay * (attempt + 1))
-                    continue
                 self.stats['failed_requests'] += 1
                 return None
 
             except Exception as e:
-                print(f"  ❌ Exception for {label}: {e}")
-                if attempt < self.retry_attempts - 1:
-                    await asyncio.sleep(self.retry_delay * (attempt + 1))
-                    continue
+                self._record_attempt(attempt_dir, "stopped", error_class=type(e).__name__)
+                print(f"  ❌ Exception for {label}: {type(e).__name__}; reconcile before retry")
                 self.stats['failed_requests'] += 1
                 return None
 
@@ -172,6 +184,64 @@ class LLMClient:
 
     # ── debug ───────────────────────────────────────────────────
 
+    @staticmethod
+    def _write_private(path: Path, data: bytes):
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+
+    def _record_attempt(self, directory: Path, status: str, **details):
+        state = {"status": status, "updated_at": time.time(), **details}
+        tmp = directory / f"state-{uuid.uuid4().hex}.tmp"
+        self._write_private(tmp, json.dumps(state, ensure_ascii=False).encode())
+        os.replace(tmp, directory / "state.json")
+
+    def _reserve_request(self, payload: Dict, meta: Dict, attempt: int) -> Path:
+        """Persist before HTTP; a shared file caps English, repair and translation POSTs."""
+        limit = int(os.getenv("SEOSCOUT_LLM_MAX_REQUESTS", "0"))
+        if limit < 0 or not 1 <= self.retry_attempts <= 3:
+            raise ValueError("invalid LLM request limits")
+        data = json.dumps(payload, ensure_ascii=False).encode()
+        if self.api_key and self.api_key.encode() in data:
+            raise ValueError("credential present in prompt")
+        root = Path(Config.LOG_DIR) / "debug" / "attempts"
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        root.chmod(0o700)
+        directory = root / uuid.uuid4().hex
+        directory.mkdir(mode=0o700)
+        self._write_private(directory / "request.json", data)
+        self._write_private(directory / "context.json", json.dumps({"meta": meta, "attempt": attempt, "request_sha256": hashlib.sha256(data).hexdigest()}, ensure_ascii=False).encode())
+        self._record_attempt(directory, "prepared")
+        if limit:
+            budget_path = root / "http-budget.json"
+            fd = os.open(budget_path, os.O_RDWR | os.O_CREAT, 0o600)
+            with os.fdopen(fd, "r+", encoding="utf-8") as budget_file:
+                fcntl.flock(budget_file, fcntl.LOCK_EX)
+                content = budget_file.read()
+                budget = json.loads(content) if content else {"limit": limit, "reserved_requests": 0, "model": self.model, "api_url": self.api_url}
+                if budget.get("limit") != limit or budget.get("model") != self.model or budget.get("api_url") != self.api_url:
+                    self._record_attempt(directory, "not_submitted", reason="budget_identity_mismatch")
+                    raise RuntimeError("budget identity mismatch")
+                for previous in budget.get("attempt_directories", []):
+                    previous_state = json.loads((Path(previous) / "state.json").read_text())
+                    if previous_state.get("status") in {"pending", "uncertain", "stopped"}:
+                        self._record_attempt(directory, "not_submitted", reason="previous_request_unresolved")
+                        raise RuntimeError("reconcile previous request before submission")
+                if budget["reserved_requests"] >= limit:
+                    self._record_attempt(directory, "not_submitted", reason="budget_exhausted")
+                    raise RuntimeError("LLM HTTP budget exhausted")
+                budget["reserved_requests"] += 1
+                budget.setdefault("attempt_directories", []).append(str(directory))
+                budget_file.seek(0)
+                budget_file.truncate()
+                budget_file.write(json.dumps(budget))
+                budget_file.flush()
+                os.fsync(budget_file.fileno())
+        self._record_attempt(directory, "pending")
+        return directory
+
     def _save_debug(self, meta: Dict, data: Dict):
         try:
             debug_dir = Path(Config.LOG_DIR) / "debug"
@@ -181,7 +251,7 @@ class LLMClient:
             fp = debug_dir / f"{lang}_{keyword.replace(' ', '_')}_response.json"
             fp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding='utf-8')
         except Exception:
-            pass
+            raise
 
     # ── stats ───────────────────────────────────────────────────
 
@@ -194,4 +264,4 @@ class LLMClient:
             if s['total_requests'] > 0 else 0
         )
         print(f"\n  📊 LLM API: {s['successful_requests']}/{s['total_requests']} ok "
-              f"({success_rate:.0f}%) | {s['total_tokens']} tokens | {duration:.1f}s")
+              f"({success_rate:.0f}%) | {s['http_requests']} HTTP attempts | {s['total_tokens']} tokens | {duration:.1f}s")

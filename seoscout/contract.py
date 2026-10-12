@@ -13,6 +13,7 @@ from typing import Any
 
 from .collect import keyword_to_filename
 from .generate import keyword_to_slug
+from .core.config import Config
 
 
 RISK_PATTERNS = [
@@ -152,7 +153,7 @@ def _validate_languages(value: Any) -> list[str]:
             raise ContractError("input", 2, f"duplicate language: {normalized}")
         seen.add(normalized)
         if normalized != "en":
-            result.append(normalized)
+            result.append(item.strip())
     return result
 
 
@@ -209,10 +210,12 @@ def _validate_entries(
         filename = keyword_to_filename(keyword)
         if category_slug:
             collected_path = Path(out_dir) / "collected" / category_slug / f"{filename}.json"
-            english_path = Path(data_dir) / "articles" / "en" / category_slug / f"{slug}.mdx"
         else:
             collected_path = Path(out_dir) / "collected" / f"{filename}.json"
-            english_path = Path(data_dir) / "articles" / "en" / f"{slug}.mdx"
+        try:
+            english_path = Config.article_path("en", slug, category, data_dir)
+        except ValueError as exc:
+            raise ContractError("input", 2, str(exc)) from exc
         entries.append(KeywordEntry(keyword, category, slug, collected_path, english_path))
 
     return entries
@@ -286,7 +289,7 @@ def _validate_article_set(spec: KeywordSpec, language: str, exit_code: int) -> N
             path = entry.english_path
         else:
             path = _translation_path(entry, language)
-        validate_mdx_file(path, entry.slug, exit_code, _stage_for_language(language))
+        validate_mdx_file(path, entry.slug, exit_code, _stage_for_language(language), entry.category or None)
 
 
 def _stage_for_language(language: str) -> str:
@@ -307,7 +310,7 @@ def _articles_root(path: Path) -> Path:
     return Path(*parts[: idx + 1])
 
 
-def validate_mdx_file(path: Path, expected_slug: str, exit_code: int = 4, stage: str = "english") -> None:
+def validate_mdx_file(path: Path, expected_slug: str, exit_code: int = 4, stage: str = "english", expected_category: str | None = None) -> None:
     if not path.is_file():
         raise ContractError(stage, exit_code, f"missing MDX file: {path}")
     if path.stem != expected_slug:
@@ -317,13 +320,13 @@ def validate_mdx_file(path: Path, expected_slug: str, exit_code: int = 4, stage:
         raise ContractError(stage, exit_code, f"empty MDX file: {path}")
     if "TODO" in content or "{{" in content or "}}" in content:
         raise ContractError(stage, exit_code, f"unreplaced placeholder detected: {path}")
-    body = _validate_js_metadata(content, path, stage, exit_code)
+    body = _validate_js_metadata(content, path, stage, exit_code, expected_category)
     if not body.strip():
         raise ContractError(stage, exit_code, f"empty MDX body: {path}")
     _validate_mdx_components(body, path, stage, exit_code)
 
 
-def _validate_js_metadata(content: str, path: Path, stage: str, exit_code: int) -> str:
+def _validate_js_metadata(content: str, path: Path, stage: str, exit_code: int, expected_category: str | None = None) -> str:
     if not content.lstrip().startswith("export const metadata = {"):
         raise ContractError(stage, exit_code, f"missing JS metadata export: {path}")
     lines = content.splitlines()
@@ -337,18 +340,44 @@ def _validate_js_metadata(content: str, path: Path, stage: str, exit_code: int) 
     if end_idx is None:
         raise ContractError(stage, exit_code, f"metadata block is not closed: {path}")
     metadata_lines = lines[1:end_idx]
+    fields = {}
     for line in metadata_lines:
         stripped = line.strip()
         if not stripped or stripped.startswith("//"):
             continue
-        match = re.match(r"[A-Za-z_$][A-Za-z0-9_$]*\s*:\s*(.+?)(,)?$", stripped)
+        match = re.match(r"([A-Za-z_$][A-Za-z0-9_$]*)\s*:\s*(.+?)(,)?$", stripped)
         if not match:
             raise ContractError(stage, exit_code, f"invalid metadata line: {path}")
-        value = match.group(1).strip()
+        key = match.group(1)
+        value = match.group(2).strip()
         if value.startswith("'"):
             raise ContractError(stage, exit_code, f"single-quoted metadata string is not allowed: {path}")
         if value.startswith('"') and not _double_quoted_value_closed(value):
             raise ContractError(stage, exit_code, f"unterminated double-quoted metadata string: {path}")
+        if key in {"title", "description", "category", "date", "slug", "translationKey"}:
+            if key in fields:
+                raise ContractError(stage, exit_code, f"duplicate metadata field {key}: {path}")
+            try:
+                parsed = json.loads(value)
+            except ValueError as exc:
+                raise ContractError(stage, exit_code, f"invalid metadata string {key}: {path}") from exc
+            if not isinstance(parsed, str) or not parsed.strip():
+                raise ContractError(stage, exit_code, f"empty metadata string {key}: {path}")
+            fields[key] = parsed
+    for key in ("title", "description", "category", "date"):
+        if key not in fields:
+            raise ContractError(stage, exit_code, f"missing metadata field {key}: {path}")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", fields["date"]):
+        raise ContractError(stage, exit_code, f"invalid metadata date: {path}")
+    try:
+        datetime.strptime(fields["date"], "%Y-%m-%d")
+    except ValueError as exc:
+        raise ContractError(stage, exit_code, f"invalid metadata date: {path}") from exc
+    if expected_category and fields["category"] != expected_category.lower().replace(" ", "-"):
+        raise ContractError(stage, exit_code, f"metadata category mismatch: {path}")
+    for key in ("slug", "translationKey"):
+        if key in fields and fields[key] != path.stem:
+            raise ContractError(stage, exit_code, f"metadata {key} mismatch: {path}")
     return "\n".join(lines[end_idx + 1 :])
 
 
