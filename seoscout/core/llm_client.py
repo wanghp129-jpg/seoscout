@@ -171,6 +171,8 @@ class LLMClient:
                 batch_results = await asyncio.gather(*tasks)
 
                 for (prompt, meta), content in zip(batch, batch_results):
+                    if not content and os.getenv("SEOSCOUT_SCOPE_SHA256"):
+                        raise RuntimeError("bounded batch stopped after failed HTTP generation")
                     results.append((meta, content))
 
                 completed = i + len(batch)
@@ -212,7 +214,7 @@ class LLMClient:
         directory = root / uuid.uuid4().hex
         directory.mkdir(mode=0o700)
         self._write_private(directory / "request.json", data)
-        self._write_private(directory / "context.json", json.dumps({"meta": meta, "attempt": attempt, "request_sha256": hashlib.sha256(data).hexdigest()}, ensure_ascii=False).encode())
+        self._write_private(directory / "context.json", json.dumps({"meta": meta, "attempt": attempt, "request_sha256": hashlib.sha256(data).hexdigest(), "scope_sha256": os.getenv("SEOSCOUT_SCOPE_SHA256")}, ensure_ascii=False).encode())
         self._record_attempt(directory, "prepared")
         if limit:
             budget_path = root / "http-budget.json"

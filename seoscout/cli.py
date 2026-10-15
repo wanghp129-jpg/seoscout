@@ -15,6 +15,9 @@ import argparse
 import json
 import os
 import sys
+import fcntl
+import hashlib
+from pathlib import Path
 
 from . import __version__
 
@@ -135,6 +138,10 @@ def main():
         "--overwrite", action="store_true",
         help="Overwrite existing articles"
     )
+    run_parser.add_argument(
+        "--batch-keywords",
+        help="Absolute keyword subset file; process one bounded batch under the full --keywords scope"
+    )
 
     args = parser.parse_args()
 
@@ -223,6 +230,7 @@ async def _run_all(args):
     from .contract import (
         ContractError,
         load_keyword_spec,
+        language_entries,
         utc_now,
         validate_collected_material,
         validate_english_articles,
@@ -244,6 +252,16 @@ async def _run_all(args):
     Config.init(args.project)
     started_at = utc_now()
     spec = None
+
+    if getattr(args, "batch_keywords", None):
+        try:
+            spec = load_keyword_spec(args.keywords, Config.DATA_DIR, Config.OUT_DIR)
+            await _run_batch(args, spec, output_root)
+        except (ContractError, ValueError, OSError) as exc:
+            code = exc.exit_code if isinstance(exc, ContractError) else 2
+            print(f"❌ Bounded batch stopped ({type(exc).__name__}); original evidence retained", file=sys.stderr)
+            sys.exit(code)
+        return
 
     try:
         spec = load_keyword_spec(args.keywords, Config.DATA_DIR, Config.OUT_DIR)
@@ -272,6 +290,7 @@ async def _run_all(args):
                 args.keywords,
                 prompt_path=args.prompt,
                 overwrite=args.overwrite,
+                entries=spec.entries,
             )
             validate_english_articles(spec)
         except ContractError:
@@ -293,6 +312,7 @@ async def _run_all(args):
                     lang_str,
                     prompt_path=None,
                     overwrite=args.overwrite,
+                    translation_entries={language: language_entries(spec, language) for language in spec.languages},
                 )
                 validate_translated_articles(spec)
             except ContractError:
@@ -336,6 +356,145 @@ async def _run_all(args):
             )
         print(f"❌ {exc.stage}: {exc.message}", file=sys.stderr)
         sys.exit(exc.exit_code)
+
+
+async def _run_batch(args, spec, output_root):
+    """One batch in the existing native run; partial never means full completion."""
+    from . import contract as c
+    from .core.config import Config
+    from .search import run_search
+    from .collect import run_collect
+    from .generate import run_generate
+    from .translate import run_translate
+
+    if args.overwrite:
+        raise c.ContractError("input", 2, "bounded batches do not overwrite accepted articles")
+    selected = c.batch_spec(spec, args.batch_keywords)
+    scope = c.batch_scope(spec, selected, output_root, args.prompt)
+    lock_path = c.checked_file(output_root / ".seoscout-run.lock")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "r+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        refs = c.verify_batch_history(spec, scope)
+        # No API/cache writes for an already accepted batch, even if the whole
+        # run is still partial or its HTTP allowance is now exhausted.
+        try:
+            c.validate_english_articles(selected, spec)
+            c.validate_translated_articles(selected, spec)
+        except c.ContractError:
+            pass
+        else:
+            if refs:
+                print("✅ Batch already accepted; original native run status unchanged")
+                return
+
+        budget_path = c.checked_file(Path(Config.LOG_DIR) / "debug/attempts/http-budget.json")
+        reserved = 0
+        if budget_path.exists():
+            budget = json.loads(budget_path.read_text())
+            if (budget.get("limit") != scope["llm_max_requests"] or budget.get("model") != Config.LLM_MODEL
+                    or budget.get("api_url") != Config.LLM_API_BASE_URL.rstrip('/') + '/chat/completions'):
+                raise c.ContractError("input", 2, "shared request budget identity mismatch")
+            reserved = budget["reserved_requests"]
+            for directory in budget.get("attempt_directories", []):
+                path = c.checked_file(Path(directory) / "state.json")
+                if json.loads(path.read_text()).get("status") in {"pending", "uncertain", "stopped"}:
+                    raise c.ContractError("input", 2, "unresolved HTTP attempt; reconcile before batch")
+        needed = sum(not entry.english_path.exists() for entry in selected.entries)
+        needed += sum(not c._translation_path(entry, language).exists()
+                      for language in spec.languages for entry in c.language_entries(selected, language))
+        if type(reserved) is not int or reserved < 0 or reserved + needed > scope["llm_max_requests"]:
+            raise c.ContractError("input", 2, "remaining HTTP budget cannot cover even the batch's missing pages")
+
+        status_path = Path(Config.OUT_DIR) / "run_status.json"
+        if status_path.exists():
+            previous = status_path.read_bytes()
+            history = c.checked_file(Path(Config.OUT_DIR) / "run-status-history")
+            history.mkdir(mode=0o700, exist_ok=True)
+            snapshot = history / (hashlib.sha256(previous).hexdigest() + ".json")
+            if snapshot.exists():
+                if snapshot.read_bytes() != previous:
+                    raise c.ContractError("manifest", 6, "status history conflict")
+            else:
+                descriptor = os.open(snapshot, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(previous); stream.flush(); os.fsync(stream.fileno())
+        started = c.utc_now()
+        counts = {"batch_manifests": refs, "batch_keywords": [entry.keyword for entry in selected.entries]}
+        c.write_run_status(Config.OUT_DIR, status="running", spec=spec, output_root=str(output_root),
+                           started_at=started, stage_counts=counts, execution_scope=scope)
+        previous_scope = os.environ.get("SEOSCOUT_SCOPE_SHA256")
+        os.environ["SEOSCOUT_SCOPE_SHA256"] = hashlib.sha256(json.dumps(
+            scope, sort_keys=True, ensure_ascii=False, separators=(',', ':')).encode()).hexdigest()
+        def frozen():
+            if c.batch_scope(spec, selected, output_root, args.prompt) != scope:
+                raise c.ContractError("input", 2, "batch inputs or implementation changed during execution")
+        try:
+            frozen()
+            await run_search(args.project, args.keywords, entries=selected.entries)
+            frozen()
+            c.validate_search_results(selected, Config.OUT_DIR)
+            await run_collect(args.project, entries=selected.entries)
+            frozen()
+            c.validate_collected_material(selected)
+            await run_generate(args.project, args.keywords, prompt_path=args.prompt, entries=selected.entries)
+            frozen()
+            c.validate_english_articles(selected, spec)
+            if spec.languages:
+                await run_translate(args.project, ",".join(spec.languages),
+                                    translation_entries=selected.translation_entries)
+                frozen()
+                c.validate_translated_articles(selected, spec)
+            c.validate_partial_set(spec)
+            manifest = c.build_traceability_manifest(selected, Config.OUT_DIR)
+            manifest.update(execution_scope=scope, request_evidence=c.article_request_evidence(selected, scope))
+            directory = c.checked_file(Path(Config.OUT_DIR) / "batches")
+            directory.mkdir(mode=0o700, exist_ok=True)
+            key = hashlib.sha256(json.dumps(counts["batch_keywords"], ensure_ascii=False).encode()).hexdigest()
+            path = c.checked_file(directory / (key + ".json"))
+            if path.exists():
+                raise c.ContractError("manifest", 6, "batch receipt already exists; reconcile instead of overwriting")
+            c._atomic_json(path, manifest, exclusive=True)
+            refs = [*refs, {"path": str(path), "sha256": c.sha256_file(path)}]
+            counts["batch_manifests"] = refs
+            complete = all(entry.english_path.is_file() for entry in spec.entries)
+            complete = complete and all(c._translation_path(entry, language).is_file()
+                                        for language in spec.languages for entry in c.language_entries(spec, language))
+            if complete:
+                c.validate_english_articles(spec)
+                c.validate_translated_articles(spec)
+                c.validate_search_results(spec, Config.OUT_DIR)
+                c.validate_collected_material(spec)
+                final = c.build_traceability_manifest(spec, Config.OUT_DIR)
+                final.update(execution_scope=scope, request_evidence=c.article_request_evidence(spec, scope))
+                final_path = Path(Config.OUT_DIR) / "traceability_manifest.json"
+                if final_path.exists():
+                    raise c.ContractError("manifest", 6, "unexpected final manifest; preserve and reconcile")
+                c._atomic_json(final_path, final, exclusive=True)
+                c.validate_traceability_manifest(final_path)
+                counts["final_manifest"] = {"path": str(final_path), "sha256": c.sha256_file(final_path)}
+            counts.update(english_articles=sum(entry.english_path.is_file() for entry in spec.entries),
+                          translation_articles={language: sum(c._translation_path(entry, language).is_file()
+                                                               for entry in c.language_entries(spec, language))
+                                                for language in spec.languages})
+            c.write_run_status(Config.OUT_DIR, status="completed" if complete else "partial", spec=spec,
+                               output_root=str(output_root), started_at=started,
+                               stage_counts=counts, execution_scope=scope)
+            if complete:
+                c.validate_run_status(status_path, expect_success=True)
+            print("✅ Full approved collection completed" if complete else "✅ Batch accepted; full run remains partial")
+        except Exception as exc:
+            code = exc.exit_code if isinstance(exc, c.ContractError) else 6
+            c.write_run_status(Config.OUT_DIR, status="failed", spec=spec, output_root=str(output_root),
+                               started_at=started, stage_counts=counts, execution_scope=scope,
+                               failure={"stage": getattr(exc, "stage", "batch"), "exit_code": code,
+                                        "message": "batch stopped; reconcile retained original evidence"})
+            raise c.ContractError("batch", code, "batch stopped; original evidence retained") from exc
+        finally:
+            if previous_scope is None:
+                os.environ.pop("SEOSCOUT_SCOPE_SHA256", None)
+            else:
+                os.environ["SEOSCOUT_SCOPE_SHA256"] = previous_scope
 
 
 if __name__ == "__main__":

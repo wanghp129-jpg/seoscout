@@ -102,6 +102,7 @@ async def run_generate(
     prompt_path: str = None,
     overwrite: bool = False,
     test: bool = False,
+    entries=None,
 ):
     """Generate articles from collected material."""
     Config.init(project)
@@ -142,6 +143,9 @@ async def run_generate(
         else:
             for kw in kw_data.get('keywords', []):
                 keyword_entries.append({'keyword': kw.strip(), 'category': ''})
+
+    if entries is not None:
+        keyword_entries = [{'keyword': entry.keyword, 'category': entry.category} for entry in entries]
 
     if not keyword_entries:
         print("  ❌ No keywords found")
@@ -249,7 +253,7 @@ async def run_generate(
         print(f"\n  🔧 Repairing {len(repair_prompts)} articles...")
         repair_results = await client.generate_batch(
             repair_prompts,
-            batch_size=min(10, len(repair_prompts)),
+            batch_size=min(Config.GENERATE_BATCH_SIZE, 10, len(repair_prompts)),
         )
 
         for meta, content in repair_results:

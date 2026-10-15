@@ -93,6 +93,7 @@ async def run_translate(
     prompt_path: str = None,
     overwrite: bool = False,
     test: bool = False,
+    translation_entries=None,
 ):
     """
     Translate English articles to target languages.
@@ -146,6 +147,10 @@ async def run_translate(
         print("  ❌ No .mdx/.md files in articles/en/")
         return
 
+    if translation_entries is not None:
+        allowed_paths = {entry.english_path for entries in translation_entries.values() for entry in entries}
+        articles = [path for path in articles if path in allowed_paths]
+
     if test:
         articles = articles[:1]
         print(f"  🧪 TEST MODE: {len(articles)} article(s)\n")
@@ -166,6 +171,9 @@ async def run_translate(
         relative = article_path.relative_to(en_dir)
 
         for lang_code in target_langs:
+            if translation_entries is not None and article_path not in {
+                    entry.english_path for entry in translation_entries[lang_code]}:
+                continue
             # Output as .mdx (change extension if source is .md)
             out_relative = relative.with_suffix('.mdx')
             output_path = Config.articles_root() / lang_code / out_relative
@@ -232,6 +240,8 @@ async def run_translate(
                 output_path = task_info['output_path']
 
                 if not content:
+                    if os.getenv("SEOSCOUT_SCOPE_SHA256"):
+                        raise RuntimeError("bounded batch stopped after failed translation")
                     failed += 1
                     print(f"    ❌ [{lang_code.upper()}] {article_name} — no response")
                     continue
@@ -265,6 +275,8 @@ async def run_translate(
                             continue
 
                     failed += 1
+                    if os.getenv("SEOSCOUT_SCOPE_SHA256"):
+                        raise RuntimeError("bounded batch translation repair failed")
                     print(f"    ❌ [{lang_code.upper()}] {article_name} — {err}")
 
             if i + batch_size < len(all_tasks):

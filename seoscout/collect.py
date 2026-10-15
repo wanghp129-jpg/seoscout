@@ -52,7 +52,7 @@ def deduplicate_items(items_by_keyword, item_type="video"):
     return unique_items, url_to_keywords
 
 
-async def run_collect(project: str):
+async def run_collect(project: str, entries=None):
     """Run the extract step programmatically."""
     Config.init(project)
 
@@ -74,7 +74,11 @@ async def run_collect(project: str):
     collected_dir = f"{Config.OUT_DIR}/collected"
     skipped_count = 0
 
-    for kw_data in data["keywords"]:
+    rows = data["keywords"]
+    if entries is not None:
+        identities = {(entry.keyword, entry.category) for entry in entries}
+        rows = [row for row in rows if (row['keyword'], row.get('category', '')) in identities]
+    for kw_data in rows:
         keyword = kw_data["keyword"]
         category = kw_data.get("category", "")
 
@@ -179,7 +183,7 @@ async def run_collect(project: str):
     ensure_dir(collected_dir)
 
     total_saved = 0
-    for kw_data in data["keywords"]:
+    for kw_data in rows:
         keyword = kw_data["keyword"]
         category = kw_data.get("category", "")
         keyword_result = results.get(keyword, {"youtube": [], "web": []})

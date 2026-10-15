@@ -173,7 +173,7 @@ async def search_with_retry(
     return results
 
 
-async def run_search(project: str, keywords_file: str):
+async def run_search(project: str, keywords_file: str, entries=None):
     """Run the collect step programmatically."""
     Config.init(project)
 
@@ -187,6 +187,8 @@ async def run_search(project: str, keywords_file: str):
     Config.print_summary()
 
     keywords = load_keywords_from_json(keywords_file)
+    if entries is not None:
+        keywords = [{'keyword': entry.keyword, 'category': entry.category} for entry in entries]
 
     if not keywords:
         print("❌ No keywords found")
@@ -246,6 +248,10 @@ async def run_search(project: str, keywords_file: str):
         print("\n✅ All keywords already have results, skipping search")
 
     keyword_data = merge_results(keywords, existing_results, yt_results, web_results)
+    if entries is not None:
+        selected = set(keyword_strings)
+        keyword_data += [{'keyword': keyword, **value} for keyword, value in existing_results.items()
+                         if keyword not in selected]
 
     pending = {
         "version": "2.0",

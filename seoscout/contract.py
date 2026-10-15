@@ -6,7 +6,8 @@ import json
 import os
 import re
 import hashlib
-from dataclasses import dataclass
+import tempfile
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,7 @@ class KeywordSpec:
     topic_name: str
     languages: list[str]
     entries: list[KeywordEntry]
+    translation_entries: dict[str, list[KeywordEntry]] | None = None
 
 
 class ContractError(Exception):
@@ -128,13 +130,211 @@ def load_keyword_spec(keywords_file: str, data_dir: str, out_dir: str) -> Keywor
     languages = _validate_languages(data.get("languages", []))
     entries = _validate_entries(raw_entries, topic, Path(data_dir), Path(out_dir))
 
-    return KeywordSpec(
+    spec = KeywordSpec(
         keywords_path=path,
         keywords_sha256=sha256_file(path),
         topic_name=topic,
         languages=languages,
         entries=entries,
     )
+    selection = data.get("translation_keywords")
+    if selection is not None:
+        if not isinstance(selection, dict) or set(selection) != set(languages):
+            raise ContractError("input", 2, "translation_keywords must exactly match languages")
+        translated_entries = {}
+        by_keyword = {entry.keyword: entry for entry in entries}
+        for language, keywords in selection.items():
+            if (not isinstance(keywords, list) or not keywords
+                    or any(not isinstance(k, str) or k not in by_keyword for k in keywords)
+                    or len(set(keywords)) != len(keywords)):
+                raise ContractError("input", 2, "translation keywords must be a non-empty unique input subset")
+            translated_entries[language] = [by_keyword[k] for k in keywords]
+        spec = replace(spec, translation_entries=translated_entries)
+    return spec
+
+
+def language_entries(spec: KeywordSpec, language: str) -> list[KeywordEntry]:
+    if language == "en" or spec.translation_entries is None:
+        return spec.entries
+    return spec.translation_entries[language]
+
+
+def batch_spec(spec: KeywordSpec, path: str) -> KeywordSpec:
+    selected = load_keyword_spec(path, Config.DATA_DIR, Config.OUT_DIR)
+    by_keyword = {entry.keyword: entry for entry in spec.entries}
+    if (selected.topic_name != spec.topic_name
+            or any(by_keyword.get(entry.keyword) != entry for entry in selected.entries)
+            or (selected.languages and selected.languages != spec.languages)
+            or selected.translation_entries is not None):
+        raise ContractError("input", 2, "batch must preserve approved keyword/category/slug identities")
+    wanted = {entry.keyword for entry in selected.entries}
+    return replace(spec, entries=selected.entries,
+                   translation_entries={language: [entry for entry in language_entries(spec, language)
+                                                    if entry.keyword in wanted]
+                                        for language in spec.languages})
+
+
+def checked_file(path: Path) -> Path:
+    if not path.is_absolute() or path.resolve() != path or any(p.is_symlink() for p in [path, *path.parents]):
+        raise ContractError("input", 2, "absolute non-redirected evidence path required")
+    return path
+
+
+def batch_scope(spec: KeywordSpec, selected: KeywordSpec, output_root: Path,
+                prompt: str | None) -> dict[str, Any]:
+    if sha256_file(spec.keywords_path) != spec.keywords_sha256:
+        raise ContractError("input", 2, "approved generation input changed")
+    data = json.loads(checked_file(spec.keywords_path).read_text())
+    scope = data.get("article_scope")
+    if not isinstance(scope, dict) or not isinstance(scope.get("authorization_ref"), str) or not scope["authorization_ref"].strip():
+        raise ContractError("input", 2, "batch run requires an explicit article_scope authorization reference")
+    domain = scope.get("domain", "")
+    if (not isinstance(domain, str) or len(domain) > 253
+            or not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]*[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]*[a-z0-9])?)+', domain)
+            or any(len(label) > 63 for label in domain.split('.'))
+            or scope.get("artifacts_root") != str(output_root)
+            or scope.get("articles_root") != str(Config.articles_root())
+            or not Config.articles_root().is_relative_to(output_root)):
+        raise ContractError("input", 2, "explicit target domain and matching artifact roots required")
+    for name in ("max_batch_keywords", "llm_max_requests"):
+        if type(scope.get(name)) is not int or scope[name] <= 0:
+            raise ContractError("input", 2, "positive approved batch and request ceilings required")
+    if len(selected.entries) > scope["max_batch_keywords"]:
+        raise ContractError("input", 2, "batch exceeds approved keyword ceiling")
+    if (int(os.getenv("SEOSCOUT_LLM_MAX_REQUESTS", "0")) != scope["llm_max_requests"]
+            or Config.GENERATE_BATCH_SIZE != 1 or Config.GENERATE_CONCURRENT_LIMIT != 1
+            or Config.TRANSLATE_BATCH_SIZE != 1):
+        raise ContractError("input", 2, "batch run requires matching shared HTTP cap and serial generation/translation")
+    candidate = scope.get("candidate_keywords", {})
+    if not isinstance(candidate, dict):
+        raise ContractError("input", 2, "candidate_keywords must be a path/hash object")
+    candidate_path = checked_file(Path(candidate.get("path", "")))
+    if not candidate_path.is_file() or sha256_file(candidate_path) != candidate.get("sha256"):
+        raise ContractError("input", 2, "candidate source hash mismatch")
+    candidates = load_keyword_spec(str(candidate_path), Config.DATA_DIR, Config.OUT_DIR)
+    if candidates.topic_name != spec.topic_name or not set(spec.entries) <= set(candidates.entries):
+        raise ContractError("input", 2, "approved generation set must preserve candidate identities")
+    prompt_path = checked_file(Path(prompt) if prompt else Path(__file__).parent / "templates/generate.md")
+    translation_prompt = Path(__file__).parent / "templates/translate.md"
+    for path in (output_root, Path(Config.OUT_DIR), Path(Config.LOG_DIR), Config.articles_root()):
+        checked_file(path)
+    private_route = json.dumps([Config.LLM_API_BASE_URL, Config.LLM_MODEL, Config.LLM_API_KEY])
+    return {"domain": domain, "keywords_path": str(spec.keywords_path), "keywords_sha256": spec.keywords_sha256,
+            "candidate_keywords": candidate, "authorization_ref": scope["authorization_ref"],
+            "max_batch_keywords": scope["max_batch_keywords"], "llm_max_requests": scope["llm_max_requests"],
+            "articles_root": str(Config.articles_root()), "output_root": str(output_root),
+            "prompt_sha256": sha256_file(prompt_path), "translation_prompt_sha256": sha256_file(translation_prompt),
+            "provider_sha256": hashlib.sha256(private_route.encode()).hexdigest(),
+            "sources": {name: sha256_file(Path(__file__).parent / name) for name in
+                        ("contract.py", "cli.py", "generate.py", "translate.py", "search.py", "collect.py",
+                         "core/config.py", "core/llm_client.py")}}
+
+
+def validate_partial_set(spec: KeywordSpec) -> None:
+    root = Config.articles_root()
+    if any(path.is_symlink() for path in root.glob("**/*")):
+        raise ContractError("manifest", 6, "redirected article tree rejected")
+    allowed = {}
+    for language in ["en", *spec.languages]:
+        for entry in language_entries(spec, language):
+            path = entry.english_path if language == "en" else _translation_path(entry, language)
+            allowed[path] = (entry, language)
+    for path in root.glob("**/*.mdx"):
+        checked_file(path)
+        if path not in allowed:
+            raise ContractError("manifest", 6, "unapproved article or unexpected locale in shared root")
+        entry, language = allowed[path]
+        validate_mdx_file(path, entry.slug, 6, "manifest", entry.category or None)
+
+
+def verify_batch_history(spec: KeywordSpec, scope: dict[str, Any]) -> list[dict[str, str]]:
+    status_path = checked_file(Path(Config.OUT_DIR) / "run_status.json")
+    root = Config.articles_root()
+    if not status_path.exists():
+        if any(root.glob("**/*.mdx")) or (Path(Config.OUT_DIR) / "traceability_manifest.json").exists():
+            raise ContractError("input", 2, "existing articles require original run evidence; no implicit adoption")
+        return []
+    previous = json.loads(status_path.read_text())
+    if previous.get("execution_scope") != scope or previous.get("status") not in {"partial", "completed"}:
+        raise ContractError("input", 2, "scope changed or previous run unresolved; reconcile original evidence first")
+    refs = previous.get("stage_counts", {}).get("batch_manifests")
+    if not isinstance(refs, list) or not refs:
+        raise ContractError("manifest", 6, "batch history missing")
+    if previous["status"] == "completed":
+        final_ref = previous.get("stage_counts", {}).get("final_manifest", {})
+        final_path = checked_file(Path(final_ref.get("path", "")))
+        if (final_path != Path(Config.OUT_DIR) / "traceability_manifest.json"
+                or sha256_file(final_path) != final_ref.get("sha256")):
+            raise ContractError("manifest", 6, "final manifest changed")
+        validate_traceability_manifest(final_path)
+    bound = set()
+    for ref in refs:
+        path = checked_file(Path(ref["path"]))
+        if path.parent != Path(Config.OUT_DIR) / "batches" or sha256_file(path) != ref["sha256"]:
+            raise ContractError("manifest", 6, "batch receipt changed")
+        validate_traceability_manifest(path)
+        manifest = json.loads(path.read_text())
+        if manifest.get("execution_scope") != scope:
+            raise ContractError("manifest", 6, "batch receipt scope mismatch")
+        for row in manifest["mappings"]:
+            bound.add(row["english_mdx_path"])
+            bound.update(item["mdx_path"] for item in row["translations"].values())
+        for raw in manifest.get("request_evidence", []):
+            if sha256_file(checked_file(Path(raw["path"]))) != raw["sha256"]:
+                raise ContractError("manifest", 6, "original request evidence changed")
+    if bound != {str(path) for path in root.glob("**/*.mdx")}:
+        raise ContractError("manifest", 6, "articles outside completed batch receipts")
+    validate_partial_set(spec)
+    return refs
+
+
+def article_request_evidence(spec: KeywordSpec, scope: dict[str, Any]) -> list[dict[str, str]]:
+    """Bind exact saved MDX bytes to the existing immutable HTTP attempts."""
+    from .generate import clean_llm_output
+    refs = {}
+    scope_sha = hashlib.sha256(json.dumps(scope, sort_keys=True, ensure_ascii=False,
+                                         separators=(',', ':')).encode()).hexdigest()
+    for language in ["en", *spec.languages]:
+        for entry in language_entries(spec, language):
+            path = entry.english_path if language == "en" else _translation_path(entry, language)
+            text = path.read_text()
+            identity = {k: json.loads(v) for k, v in re.findall(
+                r'^\s*(slug|translationKey|category|date)\s*:\s*("(?:[^"\\]|\\.)*")', text, re.M)}
+            if identity.get("slug") != entry.slug or identity.get("translationKey") != entry.slug:
+                raise ContractError("manifest", 6, "scoped articles require model-produced slug and translationKey")
+            if language != "en":
+                en_identity = {k: json.loads(v) for k, v in re.findall(
+                    r'^\s*(slug|translationKey|category|date)\s*:\s*("(?:[^"\\]|\\.)*")',
+                    entry.english_path.read_text(), re.M)}
+                if identity != en_identity:
+                    raise ContractError("manifest", 6, "translation identity differs from English")
+            matched = False
+            for directory in (Path(Config.LOG_DIR) / "debug/attempts").glob("*"):
+                if not directory.is_dir():
+                    continue
+                files = [directory / name for name in ("context.json", "request.json", "response.raw", "state.json")]
+                if not all(file.is_file() for file in files):
+                    continue
+                context = json.loads(checked_file(files[0]).read_text())
+                state = json.loads(checked_file(files[3]).read_text())
+                if state.get("status") != "response_received" or state.get("http_status") != 200:
+                    continue
+                request, response = [json.loads(checked_file(file).read_text()) for file in files[1:3]]
+                meta = context.get("meta", {})
+                if (meta.get("keyword") == (entry.keyword if language == "en" else entry.slug)
+                        and meta.get("language", "en") == language and state.get("http_status") == 200
+                        and state.get("status") == "response_received"
+                        and request.get("model") == response.get("model")
+                        and context.get("scope_sha256") == scope_sha
+                        and context.get("request_sha256") == sha256_file(files[1])
+                        and state.get("response_sha256") == sha256_file(files[2])
+                        and clean_llm_output(response.get("choices", [{}])[0].get("message", {}).get("content", "")) == text):
+                    refs.update({str(file): {"path": str(file), "sha256": sha256_file(file)} for file in files})
+                    matched = True
+                    break
+            if not matched:
+                raise ContractError("manifest", 6, "article lacks matching original request/response evidence")
+    return list(refs.values())
 
 
 def _validate_languages(value: Any) -> list[str]:
@@ -149,6 +349,8 @@ def _validate_languages(value: Any) -> list[str]:
         if not isinstance(item, str) or not item.strip():
             raise ContractError("input", 2, "languages entries must be non-empty strings")
         normalized = item.strip().lower()
+        if not re.fullmatch(r"[a-z]{2,3}(?:-(?:[a-z]{2,4}|[0-9]{3}))?", normalized):
+            raise ContractError("input", 2, "invalid or unsafe language code")
         if normalized in seen:
             raise ContractError("input", 2, f"duplicate language: {normalized}")
         seen.add(normalized)
@@ -256,17 +458,20 @@ def validate_search_results(spec: KeywordSpec, out_dir: str) -> None:
             raise ContractError("search_collect", 3, f"search returned no usable sources: {entry.keyword}")
 
 
-def validate_english_articles(spec: KeywordSpec) -> None:
-    _validate_article_set(spec, "en", 4)
+def validate_english_articles(spec: KeywordSpec, allowed_spec: KeywordSpec | None = None) -> None:
+    _validate_article_set(spec, "en", 4, allowed_spec)
 
 
-def validate_translated_articles(spec: KeywordSpec) -> None:
+def validate_translated_articles(spec: KeywordSpec, allowed_spec: KeywordSpec | None = None) -> None:
     for language in spec.languages:
-        _validate_article_set(spec, language, 5)
+        _validate_article_set(spec, language, 5, allowed_spec)
 
 
-def _validate_article_set(spec: KeywordSpec, language: str, exit_code: int) -> None:
-    expected = {entry.slug for entry in spec.entries}
+def _validate_article_set(spec: KeywordSpec, language: str, exit_code: int,
+                          allowed_spec: KeywordSpec | None = None) -> None:
+    entries = language_entries(spec, language)
+    expected = {entry.slug for entry in entries}
+    allowed = {entry.slug for entry in language_entries(allowed_spec or spec, language)}
     base = _articles_root(spec.entries[0].english_path) if spec.entries else None
     if base is None:
         raise ContractError("english" if language == "en" else "translation", exit_code, "no expected articles")
@@ -277,14 +482,14 @@ def _validate_article_set(spec: KeywordSpec, language: str, exit_code: int) -> N
     if len(actual) != len(actual_set):
         raise ContractError(_stage_for_language(language), exit_code, f"duplicate slug in {language} articles")
     missing = sorted(expected - actual_set)
-    extra = sorted(actual_set - expected)
+    extra = sorted(actual_set - allowed)
     if missing or extra:
         raise ContractError(
             _stage_for_language(language),
             exit_code,
             f"{language} slug set mismatch; missing={len(missing)} extra={len(extra)}",
         )
-    for entry in spec.entries:
+    for entry in entries:
         if language == "en":
             path = entry.english_path
         else:
@@ -407,6 +612,8 @@ def build_traceability_manifest(spec: KeywordSpec, out_dir: str) -> dict[str, An
     for entry in spec.entries:
         translations: dict[str, dict[str, str]] = {}
         for language in spec.languages:
+            if entry not in language_entries(spec, language):
+                continue
             translated = _translation_path(entry, language)
             _require_file(translated, "manifest")
             translations[language] = {
@@ -489,6 +696,7 @@ def write_run_status(
     started_at: str,
     failure: dict[str, Any] | None = None,
     stage_counts: dict[str, Any] | None = None,
+    execution_scope: dict[str, Any] | None = None,
 ) -> Path:
     payload: dict[str, Any] = {
         "status": status,
@@ -504,6 +712,8 @@ def write_run_status(
     }
     if failure is not None:
         payload["failure"] = failure
+    if execution_scope is not None:
+        payload["execution_scope"] = execution_scope
     path = Path(out_dir) / "run_status.json"
     _atomic_json(path, payload)
     return path
@@ -525,8 +735,23 @@ def validate_run_status(path: Path, expect_success: bool) -> None:
                 raise ContractError("manifest", 6, f"failed run_status missing failure.{key}")
 
 
-def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
+def _atomic_json(path: Path, payload: dict[str, Any], exclusive: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    os.replace(tmp, path)
+    descriptor, name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        if exclusive:
+            os.link(tmp, path, follow_symlinks=False)
+        else:
+            os.replace(tmp, path)
+        directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        tmp.unlink(missing_ok=True)
