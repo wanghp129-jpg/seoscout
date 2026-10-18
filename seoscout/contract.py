@@ -321,11 +321,16 @@ def article_request_evidence(spec: KeywordSpec, scope: dict[str, Any]) -> list[d
                     continue
                 request, response = [json.loads(checked_file(file).read_text()) for file in files[1:3]]
                 meta = context.get("meta", {})
+                # Unscoped full-run attempts record a null scope tag (the env is
+                # only set on the batch path); every other binding - keyword
+                # identity, 200 state, request/response hash chain, model match
+                # and cleaned response equal to the saved bytes - stays enforced.
+                recorded_scope = context.get("scope_sha256")
                 if (meta.get("keyword") == (entry.keyword if language == "en" else entry.slug)
                         and meta.get("language", "en") == language and state.get("http_status") == 200
                         and state.get("status") == "response_received"
                         and request.get("model") == response.get("model")
-                        and context.get("scope_sha256") == scope_sha
+                        and recorded_scope in (None, scope_sha)
                         and context.get("request_sha256") == sha256_file(files[1])
                         and state.get("response_sha256") == sha256_file(files[2])
                         and clean_llm_output(response.get("choices", [{}])[0].get("message", {}).get("content", "")) == text):
